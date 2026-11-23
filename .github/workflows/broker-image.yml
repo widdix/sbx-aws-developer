@@ -1,0 +1,110 @@
+# Builds the broker image and publishes it to Docker Hub as
+# widdix/sbx-aws-developer.
+#
+# - Pull requests: build and test only.
+# - Pushes to main: publish the tags main and sha-<commit>.
+# - Tags v1.2.3: publish 1.2.3, 1.2, 1 and latest.
+name: Broker image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+    paths: ["broker/**", ".github/workflows/broker-image.yml"]
+  pull_request:
+    paths: ["broker/**", ".github/workflows/broker-image.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: docker.io/widdix/sbx-aws-developer
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      # A local build for the runner's architecture to test before publishing.
+      - name: Build for testing
+        uses: docker/build-push-action@v6
+        with:
+          context: broker
+          load: true
+          tags: sbx-aws-developer:test
+          cache-from: type=gha,scope=broker
+          cache-to: type=gha,mode=max,scope=broker
+
+      - name: Test
+        run: |
+          set -eu
+          # Without profiles, the broker prints its usage and exits with 2.
+          status=0
+          docker run --rm sbx-aws-developer:test 2>/dev/null || status=$?
+          test "$status" -eq 2
+          # Invalid profile names are rejected. (No `! cmd`: set -e ignores it.)
+          if docker run --rm sbx-aws-developer:test 'a;b' 2>/dev/null; then exit 1; fi
+          if docker run --rm sbx-aws-developer:test 'a,b;c' 2>/dev/null; then exit 1; fi
+          # Commas alone are no profiles.
+          status=0
+          docker run --rm sbx-aws-developer:test , 2>/dev/null || status=$?
+          test "$status" -eq 2
+          # A profile with long-term keys is refused, and its key is not exported.
+          mkdir -p "$RUNNER_TEMP/aws" "$RUNNER_TEMP/data"
+          printf '[profile static]\nregion = eu-west-1\n' >"$RUNNER_TEMP/aws/config"
+          printf '[static]\naws_access_key_id = AKIATESTTESTTESTTEST\naws_secret_access_key = test\n' >"$RUNNER_TEMP/aws/credentials"
+          docker run -d --name broker --user "$(id -u):$(id -g)" \
+            -v "$RUNNER_TEMP/aws:/home/sbx-aws-developer/.aws" \
+            -v "$RUNNER_TEMP/data:/data" \
+            sbx-aws-developer:test static,other
+          for _ in $(seq 30); do
+            [ -e "$RUNNER_TEMP/data/credentials.json" ] && break
+            sleep 1
+          done
+          docker exec broker sbx-aws-developer-broker --status | grep -q 'static.*long-term credentials'
+          if grep -q AKIA "$RUNNER_TEMP/data/credentials.json"; then exit 1; fi
+          grep -q '^\[profile static\]' "$RUNNER_TEMP/data/aws-config"
+          # Comma-separated profiles are all defined.
+          grep -q '^\[profile other\]' "$RUNNER_TEMP/data/aws-config"
+          # A stopped broker removes what it exported.
+          docker stop broker
+          test ! -e "$RUNNER_TEMP/data/credentials.json"
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=ref,event=branch
+            type=sha
+
+      # Repository secrets: a Docker Hub user with write access to the
+      # namespace, and a personal access token with read and write scope.
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and publish
+        uses: docker/build-push-action@v6
+        with:
+          context: broker
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=broker
+          cache-to: type=gha,mode=max,scope=broker

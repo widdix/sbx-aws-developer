@@ -1,0 +1,8 @@
+# Guard against committing AWS credentials exported by an
+# sbx-aws-developer broker.
+.sbx-aws-developer/
+credentials.json
+aws-config
+.env
+.env.*
+.DS_Store

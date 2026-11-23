@@ -1,0 +1,89 @@
+# syntax=docker/sandbox-kit:3
+# yaml-language-server: $schema=https://raw.githubusercontent.com/docker/sandbox-kit-spec/main/schema/kit.schema.json
+schemaVersion: "3"
+kind: mixin
+displayName: AWS tools
+author: widdix GmbH
+description: >-
+  AWS CLI v2 and Node.js for every sandbox, as an
+  overlay on top of an agent workload, jq from the workload itself, and
+  the egress to reach AWS APIs and the npm registry.
+# Union of the shipped tools: AWS CLI (Apache-2.0), Node.js (MIT), mandoc (ISC).
+licenses: [Apache-2.0, MIT, ISC]
+version: "1.0.0"
+
+# One arg per tool. Each drives the download, the build's version check
+# and the provide, so a bump is a single edit.
+args:
+  awsCliVersion:
+    default: "2.41.1"
+    pattern: '^2\.[0-9]+\.[0-9]+$'
+    description: AWS CLI v2 release to install
+    buildArg: AWS_CLI_VERSION
+  nodeVersion:
+    default: "24.22.3"
+    pattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
+    description: Node.js release to install
+    buildArg: NODE_VERSION
+
+provides:
+  - "aws-cli@${{ kit.args.awsCliVersion }}"
+  - "node@${{ kit.args.nodeVersion }}"
+
+# jq is not part of the overlay: the Docker agent workloads already ship
+# the hardened Debian package. Requiring it makes a composition onto a
+# workload without jq fail at create instead of at first use.
+requires:
+  - deb/jq
+
+capabilities:
+  - type: com.docker.sandbox/network-policy@1
+    config:
+      runtime:
+        allow:
+          # AWS service endpoints, including regional and S3 bucket hosts.
+          - "**.amazonaws.com:443"
+          - "**.api.aws:443"
+          # AWS European Sovereign Cloud (eusc-de-east-1)
+          - "**.amazonaws.eu:443"
+          # npm install
+          - registry.npmjs.org:443
+
+  # Only @2: declaring @1 and @2 side by side makes `sbx env run` fail
+  # to attach to an existing sandbox, because it resolves the kit without
+  # its workload. No `delivery` field: sbx 0.54 rejects it as unknown.
+  - type: com.docker.sandbox/agent-context@2
+    optional: true
+    config:
+      content: |
+        ## AWS tools
+
+        This sandbox carries these tools on PATH:
+
+        - `aws` — AWS CLI ${{ kit.args.awsCliVersion }}, installed in `/usr/local/aws-cli`.
+        - `node`, `npm`, `npx` — Node.js ${{ kit.args.nodeVersion }}, installed in `/opt/node`.
+          `npm install -g` writes to the agent-owned prefix in `$NPM_CONFIG_PREFIX`.
+        - `jq` — shipped by the base image.
+
+        Do not install these again with apt, nvm or an installer script.
+
+        AWS access needs no setup. A broker on the host hands over the AWS
+        profiles the user assigned to this sandbox: `AWS_CONFIG_FILE` points to
+        `/mnt/aws-credentials/aws-config`, which defines them. Select one with
+        `AWS_PROFILE`. Each profile has the region it has on the host, if
+        any; set `AWS_REGION` or pass `--region` to use another. The
+        credentials are temporary; the broker replaces them before they
+        expire, and the AWS CLI and SDKs fetch them through
+        `credential_process`.
+
+        To find the profile for an AWS account ID, read the file with
+        `cat "$AWS_CONFIG_FILE"`: every profile states its account as
+        `aws_account_id`. The file lists all profiles you can use, so an
+        account that does not appear there is out of reach.
+
+        If a profile has no credentials, `aws sts get-caller-identity` says
+        why, for example that the SSO session on the host has expired. If no
+        profile is defined at all, the broker is not running or its directory
+        is not mounted. None of this can be fixed inside the sandbox, and
+        `aws sso login` does not work here. Tell the user what is wrong
+        instead of searching for other credentials.

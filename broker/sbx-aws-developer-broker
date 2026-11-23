@@ -1,0 +1,209 @@
+#!/bin/bash
+# The sbx-aws-developer broker for one sandbox. Runs in a container on the
+# host's Docker, where it can read the SSO session in the mounted ~/.aws.
+#
+#   sbx-aws-developer-broker <profile>[,<profile>...]...
+#                                          export the profiles (the default)
+#   sbx-aws-developer-broker --status       show what a running broker exports
+#
+# It exports temporary credentials for the given AWS profiles to
+# /data/credentials.json and replaces them before they expire. Next to it,
+# it writes /data/aws-config, which defines exactly those profiles for the
+# sandbox. The sandbox mounts /data read-only; it never sees ~/.aws.
+set -euo pipefail
+umask 077
+
+DIR="${SBX_AWS_DEVELOPER_DATA:-/data}"
+CREDENTIALS="$DIR/credentials.json"
+# AWS_CONFIG_FILE in the sandbox. Each profile states its AWS account and
+# gets its credentials from aws-credential-process, which the kit provides.
+AWS_CONFIG="$DIR/aws-config"
+
+# Seconds between two passes over the profiles.
+INTERVAL="${SBX_AWS_DEVELOPER_INTERVAL:-60}"
+# A profile is exported again once its credentials expire within this many
+# seconds. The AWS CLI hands out new ones from 15 minutes before expiry.
+REFRESH_BEFORE=900
+
+# The exported document. It contains secrets: it only ever travels through
+# stdin and files, never through command line arguments.
+state='{"profiles":{},"errors":{},"regions":{}}'
+aws_config=
+stderr=
+sleep_pid=
+profiles=()
+
+log() {
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
+}
+
+fail() {
+  echo "sbx-aws-developer-broker: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage: sbx-aws-developer-broker <profile>[,<profile>...]...
+       sbx-aws-developer-broker --status
+
+Exports temporary credentials for the given AWS profiles of the host's
+~/.aws, as separate arguments or separated by commas. The host's ~/.aws is
+mounted at $HOME/.aws, and the credentials go to /data, the directory a
+sandbox mounts at /mnt/aws-credentials.
+EOF
+  exit 2
+}
+
+# Reads credentials from stdin and prints the seconds until they expire.
+# Prints nothing for credentials without an expiration.
+seconds_remaining() {
+  jq -r '(.Expiration // empty) | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601 - now | floor' 2>/dev/null || true
+}
+
+# Replaces a file in the data directory with what it reads from stdin.
+replace() {
+  local tmp
+  tmp=$(mktemp "$DIR/.tmp.XXXXXX")
+  cat >"$tmp"
+  # A rename, so a sandbox never reads a half-written file.
+  mv -f "$tmp" "$1"
+}
+
+# Records why a profile has no credentials and logs it when that is news.
+report() {
+  local previous
+  previous=$(jq -r --arg p "$1" '.errors[$p] // empty' <<<"$state")
+  if [ "$2" != "$previous" ]; then
+    log "cannot export $1: $2"
+  fi
+  next=$(jq -c --arg p "$1" --arg e "$2" '.errors[$p] = $e' <<<"$next")
+}
+
+refresh() {
+  local next='{"profiles":{},"errors":{},"regions":{}}'
+  local config="# Written by the sbx-aws-developer broker on the host. Do not edit.
+"
+  local profile entry remaining output account region
+  for profile in "${profiles[@]}"; do
+    entry=$(jq -c --arg p "$profile" '.profiles[$p] // empty' <<<"$state")
+    region=$(jq -r --arg p "$profile" '.regions[$p] // empty' <<<"$state")
+    remaining=$(seconds_remaining <<<"$entry")
+    if [ "${remaining:-0}" -le "$REFRESH_BEFORE" ]; then
+      if ! output=$(aws configure export-credentials --profile "$profile" --format process 2>"$stderr"); then
+        report "$profile" "$(tr -s '[:space:]' ' ' <"$stderr" | sed -e 's/^ //' -e 's/ $//')"
+        # Credentials from an earlier pass stay until they expire.
+        if [ "${remaining:-0}" -le 0 ]; then
+          entry=
+        fi
+      elif ! jq -e '(.SessionToken // "") != "" and (.Expiration // "") != ""' >/dev/null <<<"$output"; then
+        # Long-term access keys never leave the host.
+        report "$profile" "the profile has long-term credentials; sbx-aws-developer hands only temporary credentials to sandboxes, for example from IAM Identity Center"
+        entry=
+      else
+        # The account of the profile travels with its credentials, so the
+        # sandbox can tell which profile belongs to which account.
+        account=$(aws configure get sso_account_id --profile "$profile" 2>/dev/null) || account=
+        case "$account" in
+          *[!0-9]*) account= ;;
+        esac
+        output=$(jq -c --arg a "$account" 'if $a == "" then . else .AccountId = $a end' <<<"$output")
+        if [ "$output" != "$entry" ]; then
+          log "exported $profile, expires $(jq -r '.Expiration' <<<"$output")"
+        fi
+        entry=$output
+        # The region of the profile on the host is its region in the sandbox.
+        region=$(aws configure get region --profile "$profile" 2>/dev/null) || region=
+        case "$region" in
+          *[!a-z0-9-]*) region= ;;
+        esac
+      fi
+    fi
+    if [ -n "$entry" ]; then
+      next=$(printf '%s\n%s\n' "$next" "$entry" | jq -cs --arg p "$profile" '.[0].profiles[$p] = .[1] | .[0]')
+      if [ -n "$region" ]; then
+        next=$(jq -c --arg p "$profile" --arg r "$region" '.regions[$p] = $r' <<<"$next")
+      fi
+    fi
+    # Every listed profile is defined, also one without credentials: the
+    # sandbox then reports why they are missing.
+    config="$config
+[profile $profile]
+"
+    account=$(jq -r '.AccountId // empty' <<<"$entry")
+    if [ -n "$account" ]; then
+      config="${config}aws_account_id = $account
+"
+    fi
+    if [ -n "$entry" ] && [ -n "$region" ]; then
+      config="${config}region = $region
+"
+    fi
+    config="${config}credential_process = aws-credential-process $profile
+"
+  done
+  if [ "$next" != "$state" ] || [ ! -e "$CREDENTIALS" ]; then
+    state=$next
+    jq . <<<"$state" | replace "$CREDENTIALS"
+  fi
+  if [ "$config" != "$aws_config" ] || [ ! -e "$AWS_CONFIG" ]; then
+    aws_config=$config
+    printf '%s' "$config" | replace "$AWS_CONFIG"
+  fi
+}
+
+cleanup() {
+  if [ -n "$sleep_pid" ]; then
+    kill "$sleep_pid" 2>/dev/null || true
+  fi
+  # A stopped broker hands out nothing.
+  rm -f "$CREDENTIALS" "$AWS_CONFIG" "$stderr"
+  log "stopped"
+}
+
+run() {
+  local arg profile parts
+  [ $# -gt 0 ] || usage
+  # Profiles come as separate arguments, comma-separated, or both.
+  for arg in "$@"; do
+    IFS=, read -r -a parts <<<"$arg"
+    for profile in "${parts[@]}"; do
+      case "$profile" in
+        '') ;;
+        # The name becomes part of a command line in the sandbox.
+        -*|*[!A-Za-z0-9._-]*) fail "invalid profile name '$profile'" ;;
+        *) profiles+=("$profile") ;;
+      esac
+    done
+  done
+  [ ${#profiles[@]} -gt 0 ] || usage
+  [ -r "$HOME/.aws/config" ] || fail "$HOME/.aws/config is missing: mount the host's ~/.aws there"
+  [ -d "$DIR" ] && [ -w "$DIR" ] || fail "$DIR is not a writable directory: mount the sandbox's directory there"
+  chmod 700 "$DIR"
+  # Outside the data directory, which the sandbox sees.
+  stderr=$(mktemp)
+  trap cleanup EXIT
+  trap 'exit 0' INT TERM
+  log "started, exporting ${profiles[*]}"
+  while true; do
+    refresh
+    # In the background, so a signal does not wait for the sleep to end.
+    sleep "$INTERVAL" &
+    sleep_pid=$!
+    wait "$sleep_pid" || true
+  done
+}
+
+status() {
+  [ -r "$CREDENTIALS" ] || fail "nothing is exported yet"
+  jq -r '
+    (.profiles | to_entries[] | "\(.key)\taccount \(.value.AccountId // "unknown")\texpires \(.value.Expiration // "never")"),
+    (.errors | to_entries[] | "\(.key)\terror: \(.value)")
+  ' "$CREDENTIALS"
+}
+
+case "${1:-}" in
+  --status) status ;;
+  ''|-h|--help) usage ;;
+  *) run "$@" ;;
+esac

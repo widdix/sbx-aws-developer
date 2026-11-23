@@ -1,0 +1,81 @@
+# Builds the kit and publishes it to Docker Hub as
+# widdix/sbx-kit-aws-developer, a source sbx allows by default.
+#
+# - Pull requests: build only.
+# - Pushes to main: publish the tag main.
+# - Tags v1.2.3: publish 1.2.3, 1.2 and 1. The tag has to match `version`
+#   in aws-developer/aws-developer.yaml.
+name: Kit image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+    paths: ["aws-developer/**", ".github/workflows/kit-image.yml"]
+  pull_request:
+    paths: ["aws-developer/**", ".github/workflows/kit-image.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: docker.io/widdix/sbx-kit-aws-developer
+
+jobs:
+  kit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check the version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -eu
+          version=$(sed -n 's/^version: "\(.*\)"$/\1/p' aws-developer/aws-developer.yaml)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $version in aws-developer/aws-developer.yaml"
+            exit 1
+          fi
+
+      - uses: docker/setup-qemu-action@v3
+      # The docker-container driver keeps the index annotations that sbx
+      # reads; a push through the docker driver can drop them.
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=ref,event=branch
+
+      # Repository secrets: a Docker Hub user with write access to the
+      # namespace, and a personal access token with read and write scope.
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # The descriptor's `# syntax=docker/sandbox-kit:3` line makes BuildKit
+      # build it with the kit frontend.
+      - name: Build and publish
+        uses: docker/build-push-action@v6
+        with:
+          context: aws-developer
+          file: aws-developer/aws-developer.yaml
+          platforms: linux/amd64,linux/arm64
+          provenance: mode=min
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha,scope=kit
+          cache-to: type=gha,mode=max,scope=kit
