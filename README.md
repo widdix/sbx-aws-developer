@@ -76,7 +76,7 @@ lifecycle:
         --restart unless-stopped --init --user "$(id -u):$(id -g)"
         -v "$HOME/.aws:/home/sbx-aws-developer/.aws"
         -v "${{ env.args.credentials }}:/data"
-        widdix/sbx-aws-developer:1 ${{ env.args.profiles }}
+        widdix/sbx-aws-developer:1.0.0 ${{ env.args.profiles }}
   preRemove:
     - name: Remove the AWS credentials broker
       command: >-
