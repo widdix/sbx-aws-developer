@@ -5,7 +5,95 @@ AWS for agents in [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/): the
 - `aws-developer/` is a kit, published as `widdix/sbx-kit-aws-developer`: an image layered on top of an agent workload such as `claude`. It brings the tools and the AWS setup.
 - `broker/` is the broker, published as `widdix/sbx-aws-developer`: a container on the host's Docker that hands temporary credentials for selected AWS profiles to one sandbox.
 
-Requires `sbx` 0.45 or later and Docker. Tested with `sbx` 0.54. Both images come from Docker Hub, so nothing is installed or checked out on the host; the AWS CLI is only needed for `aws sso login`.
+Requires `sbx` 0.45 or later and Docker. Tested with `sbx` 0.54. Both images come from Docker Hub, so nothing of this repository is installed or checked out on the host; the AWS CLI is only needed for `aws sso login`.
+
+## Getting started
+
+Give each project a directory of its own, for example in `~/Developer/env`. It holds the environment file for `sbx` next to `src`, which contains the repositories of the project: one, or several that belong together and that the agent works on in the same context, such as a backend, a frontend and their infrastructure:
+
+```
+~/Developer/env/
+├── my-project/
+│   ├── sbxenv.yaml        # environment file, stays on the host
+│   ├── .aws-credentials/  # written by the broker, created on the first run
+│   └── src/               # the sandbox's workspace
+│       ├── backend/       # repository
+│       ├── frontend/      # repository
+│       └── infra/         # repository
+└── other-project/
+    ├── sbxenv.yaml
+    └── src/
+        └── app/           # a project with a single repository
+```
+
+Only `src` is mounted into the sandbox as its workspace, so the agent sees all repositories of the project, but can neither read nor change `sbxenv.yaml`, and nothing of the setup ends up in a repository. Repositories that are not used together go into separate projects, each with its own sandbox and AWS profiles.
+
+1. Sign in to IAM Identity Center on the host, with the SSO session of your [AWS profiles](#aws-profiles):
+
+   ```sh
+   aws sso login --sso-session my-sso
+   ```
+
+2. Create the project directory and check out the repositories of the project into `src`:
+
+   ```sh
+   mkdir -p ~/Developer/env/my-project/src
+   cd ~/Developer/env/my-project/src
+   git clone <backend-repository-url> backend
+   git clone <frontend-repository-url> frontend
+   git clone <infra-repository-url> infra
+   ```
+
+3. Put this `sbxenv.yaml` into `~/Developer/env/my-project`. Set `name` and the AWS profiles the sandbox may use; the rest stays as it is:
+
+   ```yaml
+   schemaVersion: "1"
+   agent: claude
+   name: my-project
+   workspace: ./src
+   args:
+     profiles:
+       default: aws-profile-1,aws-profile-2
+       description: AWS profiles of the host that the sandbox may use, separated by commas
+       pattern: "[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*"
+   kits:
+     - widdix/sbx-kit-aws-developer:1.0.0
+   additionalWorkspaces:
+     - path: ${{ env.fileDir }}/.aws-credentials
+       target: /mnt/aws-credentials
+       readOnly: true
+   lifecycle:
+     initialize:
+       - name: Start the AWS credentials broker
+         command: >-
+           mkdir -p "${{ env.fileDir }}/.aws-credentials";
+           docker rm -f "sbx-aws-developer-$SBX_SANDBOX_NAME" >/dev/null 2>&1;
+           docker run -d --name "sbx-aws-developer-$SBX_SANDBOX_NAME"
+           --restart unless-stopped --init --user "$(id -u):$(id -g)"
+           -v "$HOME/.aws:/home/sbx-aws-developer/.aws"
+           -v "${{ env.fileDir }}/.aws-credentials:/data"
+           widdix/sbx-aws-developer:1 ${{ env.args.profiles }}
+     preRemove:
+       - name: Remove the AWS credentials broker
+         command: >-
+           docker stop "sbx-aws-developer-$SBX_SANDBOX_NAME";
+           docker rm "sbx-aws-developer-$SBX_SANDBOX_NAME"
+   ```
+
+4. Start the sandbox from the project directory and approve the host commands:
+
+   ```sh
+   cd ~/Developer/env/my-project
+   sbx env run
+   ```
+
+5. In the sandbox, pick a profile and check the credentials:
+
+   ```sh
+   AWS_PROFILE=aws-profile-1 aws sts get-caller-identity
+   ```
+
+For another project, copy the directory layout and the `sbxenv.yaml`, and change `name` and the profiles.
 
 ## AWS profiles
 
@@ -38,62 +126,17 @@ region = eu-central-1
 
 Use profiles with an `sso_session`: their session is refreshed on its own until it ends. Profiles with `sso_start_url` directly in the profile stop working when their access token expires and need `aws sso login` again.
 
-Sign in on the host before you start a sandbox:
+## The environment file
 
-```sh
-aws sso login --sso-session my-sso
-```
-
-## Set up a project with `sbx env`
-
-Put a `sbxenv.yaml` in the project. Only the two arguments at the top are yours to fill in:
-
-```yaml
-schemaVersion: "1"
-agent: claude
-workspace: .
-args:
-  profiles:
-    default: aws-profile-1,aws-profile-2
-    description: AWS profiles of the host that the sandbox may use, separated by commas
-    pattern: "[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*"
-  credentials:
-    default: /Users/<you>/.sbx-aws-developer/my-project
-    description: Directory on the host for the AWS credentials of this sandbox
-kits:
-  - widdix/sbx-kit-aws-developer:1.0.0
-additionalWorkspaces:
-  - path: ${{ env.args.credentials }}
-    target: /mnt/aws-credentials
-    readOnly: true
-lifecycle:
-  initialize:
-    - name: Start the AWS credentials broker
-      command: >-
-        mkdir -p "${{ env.args.credentials }}";
-        docker rm -f "sbx-aws-developer-$SBX_SANDBOX_NAME" >/dev/null 2>&1;
-        docker run -d --name "sbx-aws-developer-$SBX_SANDBOX_NAME"
-        --restart unless-stopped --init --user "$(id -u):$(id -g)"
-        -v "$HOME/.aws:/home/sbx-aws-developer/.aws"
-        -v "${{ env.args.credentials }}:/data"
-        widdix/sbx-aws-developer:1.0.0 ${{ env.args.profiles }}
-  preRemove:
-    - name: Remove the AWS credentials broker
-      command: >-
-        docker stop "sbx-aws-developer-$SBX_SANDBOX_NAME";
-        docker rm "sbx-aws-developer-$SBX_SANDBOX_NAME"
-```
-
-Then run `sbx env run` in the project directory.
+[Getting started](#getting-started) sets up a project with `sbx env`. What the parts of `sbxenv.yaml` do:
 
 - **`profiles`** are the [AWS profiles](#aws-profiles) the sandbox may use, separated by commas without spaces; `sbx` checks the list against the `pattern`. To change them, edit the default; the next `sbx env run` applies it, also when it attaches to an existing sandbox. For a single run, override it: `sbx env run --env-arg profiles=aws-profile-1`.
-- **`credentials`** is the directory on the host where the broker writes the credentials and the sandbox reads them. Use a different directory for each project. It has to be an absolute path: `~` is not expanded here.
-- The broker container is named after the sandbox, `sbx-aws-developer-$SBX_SANDBOX_NAME`, for example `sbx-aws-developer-claude-my-project`. `sbx` sets `SBX_SANDBOX_NAME` for the commands.
+- **`workspace: ./src`** mounts only the repositories of the project. Keep `workspace:`, even when `~/.sbxenv.yaml` sets one: without it, `sbx` rejects `additionalWorkspaces`.
+- **`${{ env.fileDir }}/.aws-credentials`** is the directory on the host where the broker writes the credentials and the sandbox reads them, next to `sbxenv.yaml`. Each project gets its own, because each project has its own directory.
+- The broker container is named after the sandbox, `sbx-aws-developer-$SBX_SANDBOX_NAME`. `sbx` sets `SBX_SANDBOX_NAME` for the commands.
 - `initialize` runs before every `create` and `run`. It replaces the broker each time, so changes to the profiles or a newer image take effect, and the credentials directory exists before the sandbox mounts it.
-- Keep `workspace:`, even when `~/.sbxenv.yaml` sets one: without it, `sbx` rejects `additionalWorkspaces`.
 - Kits and mounts apply only when a sandbox is created. Remove an existing sandbox of the project first, with `sbx env rm` or `sbx rm`.
-- `sbx` asks you to approve the host commands. Read them: the file lies in the workspace, so the agent can change it. A changed profile list or command shows up in that approval before it takes effect.
-- The paths are personal, so keep the file out of version control, for example with `sbxenv.yaml` in `.gitignore`.
+- `sbx` asks you to approve the host commands. A changed profile list or command shows up in that approval before it takes effect.
 - The commands are written for the shell on macOS and Linux. `--user` makes the files the broker writes yours; Docker Desktop does that on its own, but on Linux it is required.
 
 `sbx env` is experimental; see the [environment file documentation](https://docs.docker.com/ai/sandboxes/configuration/environment-files/).
@@ -181,7 +224,7 @@ The broker runs as your user and mounts `~/.aws` read-write, because the AWS CLI
 
 - Only temporary credentials reach a sandbox. The broker refuses profiles with long-term access keys and reports them as an error.
 - A sandbox can read the credentials of every profile assigned to it, whichever one `AWS_PROFILE` selects, and nothing else: it mounts only its own credentials directory. Assign only profiles that the agent may use, and prefer roles with least privilege.
-- With `sbx env`, the profiles are part of `sbxenv.yaml` in the workspace, which the agent can edit. A change takes effect only through a host command you approve.
+- With `sbx env`, the profiles are part of `sbxenv.yaml`. Keep it outside the workspace, as in [Getting started](#getting-started), so the agent cannot change it. A change takes effect only through a host command you approve.
 - Credentials are temporary and are no longer refreshed once the broker stops or your SSO session expires, but credentials already handed out stay valid until their expiration (the session duration of the permission set: one hour by default, up to twelve). Copies an agent made are not revoked by stopping the broker.
 - The SSO session and its refresh token stay on the host. The sandbox never sees `~/.aws`; the brokers run on the host's Docker, not on the sandbox's own Docker daemon. A broker has no access to Docker itself.
 - The kit allows egress to all AWS endpoints, so credentials can be used against any account and region they are valid for.
