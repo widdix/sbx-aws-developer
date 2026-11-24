@@ -15,6 +15,7 @@ Give each project a directory of its own, for example in `~/Developer/env`. It h
 ~/Developer/env/
 ├── my-project/
 │   ├── sbxenv.yaml        # environment file, stays on the host
+│   ├── scoped-policy.json # optional IAM policy that scopes down the credentials
 │   ├── .aws-credentials/  # written by the broker, created on the first run
 │   └── src/               # the sandbox's workspace
 │       ├── backend/       # repository
@@ -26,7 +27,7 @@ Give each project a directory of its own, for example in `~/Developer/env`. It h
         └── app/           # a project with a single repository
 ```
 
-Only `src` is mounted into the sandbox as its workspace, so the agent sees all repositories of the project, but can neither read nor change `sbxenv.yaml`, and nothing of the setup ends up in a repository. Repositories that are not used together go into separate projects, each with its own sandbox and AWS profiles.
+Only `src` is mounted into the sandbox as its workspace, so the agent sees all repositories of the project, but can neither read nor change `sbxenv.yaml` and `scoped-policy.json`, and nothing of the setup ends up in a repository. Repositories that are not used together go into separate projects, each with its own sandbox and AWS profiles.
 
 1. Sign in to IAM Identity Center on the host, with the SSO session of your [AWS profiles](#aws-profiles):
 
@@ -56,6 +57,10 @@ Only `src` is mounted into the sandbox as its workspace, so the agent sees all r
        default: aws-profile-1,aws-profile-2
        description: AWS profiles of the host that the sandbox may use, separated by commas
        pattern: "[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*"
+     scoped_policy:
+       default: scoped-policy.json
+       description: Optional file next to sbxenv.yaml with an IAM policy that scopes down the credentials; empty for none
+       pattern: "[A-Za-z0-9._-]*"
    kits:
      - widdix/sbx-kit-aws-developer:1.0.0
    additionalWorkspaces:
@@ -71,6 +76,8 @@ Only `src` is mounted into the sandbox as its workspace, so the agent sees all r
            docker run -d --name "sbx-aws-developer-$SBX_SANDBOX_NAME"
            --restart unless-stopped --init --user "$(id -u):$(id -g)"
            -v "$HOME/.aws:/home/sbx-aws-developer/.aws"
+           -v "${{ env.fileDir }}:/project:ro" -w /project
+           -e SBX_AWS_DEVELOPER_SCOPED_POLICY="${{ env.args.scoped_policy }}"
            -v "${{ env.fileDir }}/.aws-credentials:/data"
            widdix/sbx-aws-developer:1 ${{ env.args.profiles }}
      preRemove:
@@ -80,14 +87,27 @@ Only `src` is mounted into the sandbox as its workspace, so the agent sees all r
            docker rm "sbx-aws-developer-$SBX_SANDBOX_NAME"
    ```
 
-4. Start the sandbox from the project directory and approve the host commands:
+4. Put this `scoped-policy.json` next to it. The sandbox gets the permissions of the profile that this policy allows. This example allows everything, so it changes nothing; [narrow it down](#scoped-credentials) to hand the agent less:
+
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {"Effect": "Allow", "Action": "*", "Resource": "*"}
+     ]
+   }
+   ```
+
+   To work without scoping, set the default of `scoped_policy` to `""`.
+
+5. Start the sandbox from the project directory and approve the host commands:
 
    ```sh
    cd ~/Developer/env/my-project
    sbx env run
    ```
 
-5. In the sandbox, pick a profile and check the credentials:
+6. In the sandbox, pick a profile and check the credentials:
 
    ```sh
    AWS_PROFILE=aws-profile-1 aws sts get-caller-identity
@@ -126,6 +146,25 @@ region = eu-central-1
 
 Use profiles with an `sso_session`: their session is refreshed on its own until it ends. Profiles with `sso_start_url` directly in the profile stop working when their access token expires and need `aws sso login` again.
 
+## Scoped credentials
+
+Without a scoped policy, a sandbox gets the credentials of its profiles as they are. With one, it gets less. Put an IAM policy document into a file next to `sbxenv.yaml`, outside the workspace, and name it in the `scoped_policy` argument; [Getting started](#getting-started) uses `scoped-policy.json`. This one only allows reading S3:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Effect": "Allow", "Action": ["s3:Get*", "s3:List*"], "Resource": "*"}
+  ]
+}
+```
+
+Set the argument's default in `sbxenv.yaml`, or pass it for a single run, for example `sbx env run --env-arg scoped_policy=other-policy.json`; an empty value turns scoping off. The broker then calls [STS GetScopedCredentials](https://aws.amazon.com/blogs/security/scope-down-permissions-of-existing-sessions-using-aws-sts-getscopedcredentials/) and exports the scoped down credentials instead: the permissions of the profile intersected with the policy, so the policy can only take permissions away. No additional IAM role is needed. The policy applies to all profiles of the sandbox.
+
+- The policy has at most 2048 characters, and the profiles need a `region`, because the API is not on the global STS endpoint.
+- If the file does not exist, the broker stops with an error in `docker logs`. If scoping fails, the profile gets no credentials and the error shows in `--status`. The broker never falls back to unscoped credentials.
+- Without `sbx env`, pass `--scoped-policy /policy.json` before the profiles and mount the file there: `-v "$PWD/policy.json:/policy.json:ro"`.
+
 ## The environment file
 
 [Getting started](#getting-started) sets up a project with `sbx env`. What the parts of `sbxenv.yaml` do:
@@ -135,7 +174,7 @@ Use profiles with an `sso_session`: their session is refreshed on its own until 
 - **`${{ env.fileDir }}/.aws-credentials`** is the directory on the host where the broker writes the credentials and the sandbox reads them, next to `sbxenv.yaml`. Each project gets its own, because each project has its own directory.
 - The broker container is named after the sandbox, `sbx-aws-developer-$SBX_SANDBOX_NAME`. `sbx` sets `SBX_SANDBOX_NAME` for the commands.
 - `initialize` runs before every `create` and `run`. It replaces the broker each time, so changes to the profiles or a newer image take effect, and the credentials directory exists before the sandbox mounts it.
-- Kits and mounts apply only when a sandbox is created. Remove an existing sandbox of the project first, with `sbx env rm` or `sbx rm`.
+- Kits and mounts apply only when a sandbox is created. Remove an existing sandbox of the project first, with `sbx env rm`. It also stops and removes the broker; `sbx rm` removes only the sandbox and leaves the broker running.
 - `sbx` asks you to approve the host commands. A changed profile list or command shows up in that approval before it takes effect.
 - The commands are written for the shell on macOS and Linux. `--user` makes the files the broker writes yours; Docker Desktop does that on its own, but on Linux it is required.
 

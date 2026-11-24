@@ -54,6 +54,10 @@ jobs:
           # Invalid profile names are rejected. (No `! cmd`: set -e ignores it.)
           if docker run --rm sbx-aws-developer:test 'a;b' 2>/dev/null; then exit 1; fi
           if docker run --rm sbx-aws-developer:test 'a,b;c' 2>/dev/null; then exit 1; fi
+          # A missing or invalid scoped policy is rejected.
+          if docker run --rm sbx-aws-developer:test --scoped-policy /nope.json p 2>/dev/null; then exit 1; fi
+          echo '[]' > "$RUNNER_TEMP/policy.json"
+          if docker run --rm -v "$RUNNER_TEMP/policy.json:/policy.json:ro" sbx-aws-developer:test --scoped-policy /policy.json p 2>/dev/null; then exit 1; fi
           # Commas alone are no profiles.
           status=0
           docker run --rm sbx-aws-developer:test , 2>/dev/null || status=$?

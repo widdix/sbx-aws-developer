@@ -2,7 +2,7 @@
 # The sbx-aws-developer broker for one sandbox. Runs in a container on the
 # host's Docker, where it can read the SSO session in the mounted ~/.aws.
 #
-#   sbx-aws-developer-broker <profile>[,<profile>...]...
+#   sbx-aws-developer-broker [--scoped-policy <file>] <profile>[,<profile>...]...
 #                                          export the profiles (the default)
 #   sbx-aws-developer-broker --status       show what a running broker exports
 #
@@ -10,6 +10,11 @@
 # /data/credentials.json and replaces them before they expire. Next to it,
 # it writes /data/aws-config, which defines exactly those profiles for the
 # sandbox. The sandbox mounts /data read-only; it never sees ~/.aws.
+#
+# With --scoped-policy, the exported credentials are scoped down with the
+# IAM policy document in <file>, using STS GetScopedCredentials: they get
+# the intersection of the profile's permissions and the policy. Without
+# it, the credentials of the profile are exported as they are.
 set -euo pipefail
 umask 077
 
@@ -32,6 +37,8 @@ aws_config=
 stderr=
 sleep_pid=
 profiles=()
+# The scope down policy as compact JSON, empty for none.
+scoped_policy=
 
 log() {
   printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
@@ -44,13 +51,19 @@ fail() {
 
 usage() {
   cat >&2 <<'EOF'
-usage: sbx-aws-developer-broker <profile>[,<profile>...]...
+usage: sbx-aws-developer-broker [--scoped-policy <file>] <profile>[,<profile>...]...
        sbx-aws-developer-broker --status
 
 Exports temporary credentials for the given AWS profiles of the host's
 ~/.aws, as separate arguments or separated by commas. The host's ~/.aws is
 mounted at $HOME/.aws, and the credentials go to /data, the directory a
 sandbox mounts at /mnt/aws-credentials.
+
+--scoped-policy <file>, or the environment variable
+SBX_AWS_DEVELOPER_SCOPED_POLICY, scopes the credentials down with the IAM
+policy document in <file> (STS GetScopedCredentials, at most 2048
+characters). A relative <file> is relative to the working directory. The
+profiles need a region, because the API is not on the global endpoint.
 EOF
   exit 2
 }
@@ -80,6 +93,21 @@ report() {
   next=$(jq -c --arg p "$1" --arg e "$2" '.errors[$p] = $e' <<<"$next")
 }
 
+# Reads credentials in the process format from stdin and prints them scoped
+# down with the policy, in the same format. $1 is the region of the STS
+# endpoint. The credentials go through the environment, never through
+# arguments.
+scope_down() {
+  local credentials scoped
+  credentials=$(cat)
+  scoped=$(AWS_ACCESS_KEY_ID=$(jq -r .AccessKeyId <<<"$credentials") \
+    AWS_SECRET_ACCESS_KEY=$(jq -r .SecretAccessKey <<<"$credentials") \
+    AWS_SESSION_TOKEN=$(jq -r .SessionToken <<<"$credentials") \
+    aws sts get-scoped-credentials --region "$1" --policy "$scoped_policy" \
+      --scoped-session-description "sbx-aws-developer" --output json 2>"$stderr") || return 1
+  jq -c '.Credentials | {Version: 1, AccessKeyId, SecretAccessKey, SessionToken, Expiration}' <<<"$scoped"
+}
+
 refresh() {
   local next='{"profiles":{},"errors":{},"regions":{}}'
   local config="# Written by the sbx-aws-developer broker on the host. Do not edit.
@@ -100,6 +128,15 @@ refresh() {
         # Long-term access keys never leave the host.
         report "$profile" "the profile has long-term credentials; sbx-aws-developer hands only temporary credentials to sandboxes, for example from IAM Identity Center"
         entry=
+      elif ! region=$(aws configure get region --profile "$profile" 2>/dev/null) && [ -n "$scoped_policy" ]; then
+        report "$profile" "the profile has no region, which scoping down the credentials needs: set region in the profile"
+        entry=
+      elif [ -n "$scoped_policy" ] && ! output=$(scope_down "$region" <<<"$output"); then
+        # Never fall back to the unscoped credentials.
+        report "$profile" "cannot scope down the credentials: $(tr -s '[:space:]' ' ' <"$stderr" | sed -e 's/^ //' -e 's/ $//')"
+        if [ "${remaining:-0}" -le 0 ]; then
+          entry=
+        fi
       else
         # The account of the profile travels with its credentials, so the
         # sandbox can tell which profile belongs to which account.
@@ -113,7 +150,6 @@ refresh() {
         fi
         entry=$output
         # The region of the profile on the host is its region in the sandbox.
-        region=$(aws configure get region --profile "$profile" 2>/dev/null) || region=
         case "$region" in
           *[!a-z0-9-]*) region= ;;
         esac
@@ -162,7 +198,17 @@ cleanup() {
 }
 
 run() {
-  local arg profile parts
+  local arg profile parts policy_file=${SBX_AWS_DEVELOPER_SCOPED_POLICY:-}
+  if [ "${1:-}" = "--scoped-policy" ]; then
+    [ $# -ge 2 ] || usage
+    policy_file=$2
+    shift 2
+  fi
+  if [ -n "$policy_file" ]; then
+    [ -r "$policy_file" ] || fail "cannot read the scoped policy $policy_file"
+    scoped_policy=$(jq -ec 'select(type == "object")' "$policy_file") || fail "$policy_file is not a JSON policy document"
+    [ ${#scoped_policy} -le 2048 ] || fail "the scoped policy has ${#scoped_policy} characters, the limit is 2048"
+  fi
   [ $# -gt 0 ] || usage
   # Profiles come as separate arguments, comma-separated, or both.
   for arg in "$@"; do
@@ -184,7 +230,7 @@ run() {
   stderr=$(mktemp)
   trap cleanup EXIT
   trap 'exit 0' INT TERM
-  log "started, exporting ${profiles[*]}"
+  log "started, exporting ${profiles[*]}${policy_file:+ scoped down with $policy_file}"
   while true; do
     refresh
     # In the background, so a signal does not wait for the sleep to end.
