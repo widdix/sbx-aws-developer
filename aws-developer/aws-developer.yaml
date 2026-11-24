@@ -10,7 +10,7 @@ description: >-
   the egress to reach AWS APIs and the npm registry.
 # Union of the shipped tools: AWS CLI (Apache-2.0), Node.js (MIT), mandoc (ISC).
 licenses: [Apache-2.0, MIT, ISC]
-version: "1.0.0"
+version: "1.1.0"
 
 # One arg per tool. Each drives the download, the build's version check
 # and the provide, so a bump is a single edit.
