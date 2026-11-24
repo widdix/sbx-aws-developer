@@ -8,7 +8,7 @@ LABEL org.opencontainers.image.source=https://github.com/widdix/sbx-aws-develope
 LABEL org.opencontainers.image.description="Hands temporary AWS credentials of selected profiles to a Docker Sandbox"
 LABEL org.opencontainers.image.licenses=Apache-2.0
 ARG TARGETARCH
-ARG AWS_CLI_VERSION=2.41.1
+ARG AWS_CLI_VERSION=2.42.2
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl jq unzip \
