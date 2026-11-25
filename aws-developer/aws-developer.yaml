@@ -10,7 +10,7 @@ description: >-
   the egress to reach AWS APIs and the npm registry.
 # Union of the shipped tools: AWS CLI (Apache-2.0), Node.js (MIT), mandoc (ISC).
 licenses: [Apache-2.0, MIT, ISC]
-version: "1.1.0"
+version: "1.2.0"
 
 # One arg per tool. Each drives the download, the build's version check
 # and the provide, so a bump is a single edit.
@@ -48,6 +48,14 @@ capabilities:
           - "**.amazonaws.eu:443"
           # npm install
           - registry.npmjs.org:443
+
+  # The user's Git name and email from the runtime, set as the sandbox's
+  # global user.name and user.email; repository settings still win.
+  # Optional: without an identity on the host the sandbox starts anyway.
+  # The entry must not carry `config`.
+  - type: com.docker.sandbox/git-identity@1
+    optional: true
+    description: Attribute commits to the user's Git identity
 
   # Only @2: declaring @1 and @2 side by side makes `sbx env run` fail
   # to attach to an existing sandbox, because it resolves the kit without

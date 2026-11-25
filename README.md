@@ -62,7 +62,7 @@ Only `src` is mounted into the sandbox as its workspace, so the agent sees all r
        description: Optional file next to sbxenv.yaml with an IAM policy that scopes down the credentials; empty for none
        pattern: "[A-Za-z0-9._-]*"
    kits:
-     - widdix/sbx-kit-aws-developer:1.1.0
+     - widdix/sbx-kit-aws-developer:1.2.0
    additionalWorkspaces:
      - path: ${{ env.fileDir }}/.aws-credentials
        target: /mnt/aws-credentials
@@ -193,7 +193,7 @@ docker run -d --name sbx-aws-developer-my-project --restart unless-stopped --ini
   widdix/sbx-aws-developer:1 aws-profile-1,aws-profile-2
 
 cd my-project
-sbx run claude --kit widdix/sbx-kit-aws-developer:1.1.0 . ~/.sbx-aws-developer/my-project:/mnt/aws-credentials:ro
+sbx run claude --kit widdix/sbx-kit-aws-developer:1.2.0 . ~/.sbx-aws-developer/my-project:/mnt/aws-credentials:ro
 ```
 
 To change the profiles, remove the broker with `docker rm -f sbx-aws-developer-my-project` and start it again with the new list. A running sandbox picks up the change within a minute.
@@ -226,12 +226,26 @@ Each tool version is a kit argument with a default in `aws-developer/aws-develop
 Override one for a single sandbox:
 
 ```sh
-sbx run claude --kit widdix/sbx-kit-aws-developer:1.1.0 --kit-arg nodeVersion=22.23.5
+sbx run claude --kit widdix/sbx-kit-aws-developer:1.2.0 --kit-arg nodeVersion=22.23.5
 ```
 
 To change it for everyone, edit the default and release a new kit version. The build fails if the installed version does not match.
 
 The kit also sets `AWS_PAGER` to empty, and allows egress to `**.amazonaws.com`, `**.api.aws`, `**.amazonaws.eu` and `registry.npmjs.org`.
+
+## Git author
+
+The kit asks `sbx` for your Git identity, so commits in the sandbox carry your name and email. `sbx` takes them from the host and sets them as the global `user.name` and `user.email` in the sandbox; a repository's own settings still take precedence. The sandbox keeps the identity it got at creation, so after changing it on the host, recreate the sandbox. Without an identity, the sandbox starts anyway, and Git refuses to commit.
+
+To use another author, set it in `sbxenv.yaml`, or in `~/.sbxenv.yaml` for all projects. These variables override the settings of every repository in the sandbox:
+
+```yaml
+env:
+  GIT_AUTHOR_NAME: Your Name
+  GIT_AUTHOR_EMAIL: you@example.com
+  GIT_COMMITTER_NAME: Your Name
+  GIT_COMMITTER_EMAIL: you@example.com
+```
 
 ## How it works
 
@@ -280,7 +294,7 @@ GitHub Actions builds both images for `linux/amd64` and `linux/arm64` and publis
 | Push to `main` | `main`, `sha-<commit>` | `main` |
 | Pull request | Built and tested, not published | Built, not published |
 
-To release, set `version` in `aws-developer/aws-developer.yaml` and push a matching tag: `git tag v1.1.0 && git push origin v1.1.0`. The kit workflow fails if the two differ. Reference the kit by its full version, as Docker recommends: `latest` can move to a kit that needs a newer `sbx`.
+To release, set `version` in `aws-developer/aws-developer.yaml` and push a matching tag: `git tag v1.2.0 && git push origin v1.2.0`. The kit workflow fails if the two differ. Reference the kit by its full version, as Docker recommends: `latest` can move to a kit that needs a newer `sbx`.
 
 The workflows log in to Docker Hub with the repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`, a personal access token with read and write scope for the `widdix` namespace.
 
